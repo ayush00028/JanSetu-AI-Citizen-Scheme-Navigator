@@ -109,3 +109,4 @@ The scripts stop if the Git index already contains staged changes, so review or 
 ## Deployment
 
 The repository includes `render.yaml` and a `Procfile` for deployment. Set `DATABASE_URL` to a PostgreSQL connection string in production.
+# Jansetu-Gemini-assistant

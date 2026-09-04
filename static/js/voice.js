@@ -1,6 +1,7 @@
-let recognition = null;
 let isListening = false;
-let recognitionHandler = null;
+let mediaRecorder = null;
+let mediaStream = null;
+let audioChunks = [];
 let voiceEnabled = localStorage.getItem('csn_voice_enabled') !== 'false';
 
 function setVoiceEnabled(enabled) {
@@ -8,28 +9,40 @@ function setVoiceEnabled(enabled) {
   localStorage.setItem('csn_voice_enabled', String(enabled));
   const mic = document.getElementById('micBtn');
   if (mic) { mic.disabled = !enabled; mic.setAttribute('aria-disabled', String(!enabled)); }
-  if (!enabled && isListening) recognition?.stop();
+  if (!enabled && isListening) stopListening();
 }
-function initSpeechRecognition(onResult) {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) return null;
-  recognition = new SpeechRecognition();
-  recognition.continuous = false; recognition.interimResults = false; recognition.maxAlternatives = 3;
-  recognitionHandler = onResult;
-  recognition.onresult = event => recognitionHandler?.(event.results[0][0].transcript.trim());
-  recognition.onend = () => { isListening = false; document.getElementById('micBtn')?.classList.remove('listening'); };
-  recognition.onerror = event => { isListening = false; document.getElementById('micBtn')?.classList.remove('listening'); if (event.error === 'language-not-supported') alert('Hindi voice recognition is not available in this browser. Try Chrome or use typed Hindi.'); };
-  return recognition;
+function resetRecorder() {
+  isListening = false;
+  document.getElementById('micBtn')?.classList.remove('listening');
+  mediaStream?.getTracks().forEach(track => track.stop());
+  mediaStream = null; mediaRecorder = null;
 }
-function toggleListening(onResult) {
-  if (!voiceEnabled) return;
-  if (!recognition) recognition = initSpeechRecognition(onResult);
-  if (!recognition) { alert('Voice recognition is not supported in this browser.'); return; }
-  recognitionHandler = onResult;
+function stopListening() { if (mediaRecorder?.state === 'recording') mediaRecorder.stop(); }
+async function toggleListening(onResult) {
+  if (!voiceEnabled || currentLang !== 'hi') { alert('Choose हिन्दी to use Hindi voice input.'); return; }
   const micBtn = document.getElementById('micBtn');
-  if (isListening) { recognition.stop(); return; }
-  recognition.lang = document.getElementById('langSelect')?.value === 'hi' ? 'hi-IN' : 'en-IN';
-  try { recognition.start(); isListening = true; micBtn?.classList.add('listening'); } catch (_) { recognition.stop(); }
+  if (isListening) { stopListening(); return; }
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { alert('Voice input is not supported in this browser.'); return; }
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = 'audio/webm;codecs=opus';
+    mediaRecorder = new MediaRecorder(mediaStream, MediaRecorder.isTypeSupported(mimeType) ? { mimeType } : undefined);
+    audioChunks = [];
+    mediaRecorder.ondataavailable = event => { if (event.data.size) audioChunks.push(event.data); };
+    mediaRecorder.onstop = async () => {
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      resetRecorder();
+      const formData = new FormData(); formData.append('audio', blob, 'hindi-voice.webm');
+      try {
+        const response = await fetch('/api/chat/transcribe', { method: 'POST', body: formData, credentials: 'same-origin' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Voice transcription failed.');
+        onResult(data.transcript);
+      } catch (error) { alert(error.message || 'Voice transcription failed.'); }
+    };
+    mediaRecorder.start(); isListening = true; micBtn?.classList.add('listening');
+    window.setTimeout(() => { if (isListening) stopListening(); }, 55000);
+  } catch (_) { resetRecorder(); alert('Microphone permission is required for Hindi voice input.'); }
 }
 function speakText(text, lang = 'en') {
   if (!('speechSynthesis' in window)) return;

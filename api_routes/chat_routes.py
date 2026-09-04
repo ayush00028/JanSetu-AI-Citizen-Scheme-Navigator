@@ -1,7 +1,11 @@
 import json
 import uuid
 from urllib.parse import quote_plus
-from fastapi import APIRouter, Depends
+import base64
+import os
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, Profile, ChatMessage, Service, Scheme
@@ -9,6 +13,7 @@ from schemas import ChatRequest
 from auth import get_current_user
 from nlp_engine import process_message
 from scoring import compute_profile_completeness
+from ai_assistant import generate_citizen_reply
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -29,6 +34,14 @@ def send_message(payload: ChatRequest, user: User = Depends(get_current_user), d
 
     language = payload.language if payload.language in {"en", "hi"} else user.language_pref
     result = process_message(payload.message, language=language, profile_ctx=profile_ctx)
+    recent_messages = (db.query(ChatMessage).filter(ChatMessage.user_id == user.id)
+                       .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc()).limit(6).all())
+    ai_response = generate_citizen_reply(
+        payload.message, language, profile_ctx,
+        db.query(Scheme).all(), db.query(Service).all(), list(reversed(recent_messages)),
+    )
+    if ai_response:
+        result["response"] = ai_response
 
     user_msg = ChatMessage(
         user_id=user.id, session_id=session_id, sender="user",
@@ -118,3 +131,44 @@ def clear_history(session_id: str = "default", user: User = Depends(get_current_
 @router.get("/new-session")
 def new_session():
     return {"session_id": str(uuid.uuid4())}
+
+
+@router.post("/transcribe")
+async def transcribe_hindi(audio: UploadFile = File(...), user: User = Depends(get_current_user)):
+    """Transcribe a short microphone clip with Google Cloud Speech-to-Text."""
+    api_key = os.getenv("GOOGLE_SPEECH_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(503, "Voice transcription is not configured.")
+    if audio.content_type not in {"audio/webm", "audio/webm;codecs=opus"}:
+        raise HTTPException(415, "Please record audio in WebM format.")
+    content = await audio.read()
+    if not content:
+        raise HTTPException(400, "The audio recording is empty.")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Voice recordings must be under 10 MB.")
+    payload = json.dumps({
+        "config": {
+            "encoding": "WEBM_OPUS", "sampleRateHertz": 48000,
+            "languageCode": "hi-IN", "enableAutomaticPunctuation": True,
+        },
+        "audio": {"content": base64.b64encode(content).decode("ascii")},
+    }).encode("utf-8")
+    request = Request(
+        f"https://speech.googleapis.com/v1/speech:recognize?key={api_key}", payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise HTTPException(503, "Google Speech-to-Text is not enabled for this API key.")
+        raise HTTPException(502, "Google Speech-to-Text could not process the recording.")
+    except (URLError, TimeoutError, ValueError):
+        raise HTTPException(502, "Google Speech-to-Text is temporarily unavailable.")
+    transcript = " ".join(
+        item.get("alternatives", [{}])[0].get("transcript", "") for item in result.get("results", [])
+    ).strip()
+    if not transcript:
+        raise HTTPException(422, "No Hindi speech was detected. Please try again.")
+    return {"transcript": transcript}
